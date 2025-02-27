@@ -1,14 +1,13 @@
 """Transaction fetcher for DexTools API."""
 import asyncio
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Any, Union
-from datetime import datetime, timedelta
 
-from src.api.dextools import DexToolsApiClient
 from src.api.cache import CacheManager
-from src.api.exceptions import APIError
+from src.api.dextools import DexToolsApiClient
+from src.data.database import AsyncSession, db
 from src.models.entities import Transaction
-from src.data.database import get_session, AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -297,22 +296,23 @@ class TransactionFetcher:
     ) -> List[Transaction]:
         """
         Store transactions in the database.
-
-        Args:
-            chain: Blockchain identifier
-            pair_address: Trading pair contract address
-            transactions: List of normalized transaction dictionaries
-            db_session: Database session to use
-
-        Returns:
-            List of created Transaction objects
         """
-        # Get a database session if not provided
-        close_session = False
-        if db_session is None:
-            db_session = get_session()
-            close_session = True
+        if db_session is not None:
+            # Use provided session
+            return await self._store_with_session(chain, pair_address, transactions, db_session)
+        else:
+            # Create our own session using context manager
+            async with db.session() as session:
+                return await self._store_with_session(chain, pair_address, transactions, session)
 
+    async def _store_with_session(
+            self,
+            chain: str,
+            pair_address: str,
+            transactions: List[Dict[str, Any]],
+            db_session: AsyncSession
+    ) -> List[Transaction]:
+        """Helper method to store transactions with a given session."""
         try:
             # Create Transaction objects from normalized data
             transaction_objects = []
@@ -347,11 +347,6 @@ class TransactionFetcher:
             await db_session.rollback()
             logger.error(f"Error storing transactions: {e}")
             raise
-
-        finally:
-            # Close the session if we created it
-            if close_session:
-                await db_session.close()
 
     async def fetch_and_store_transactions(
             self,

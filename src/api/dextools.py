@@ -10,7 +10,7 @@ import backoff
 import aiohttp
 from aiohttp.client_exceptions import ClientError, ClientResponseError
 
-from src.config import settings
+from config.settings import Settings
 from src.api.exceptions import (
     APIError, AuthenticationError, RateLimitError,
     ResourceNotFoundError, BadRequestError, ServerError,
@@ -49,7 +49,7 @@ class DexToolsApiClient:
             max_retries: Maximum number of retries for failed requests
             session: Aiohttp session to use, will create one if not provided
         """
-        self.api_key = api_key or settings.DEXTOOLS_API_KEY
+        self.api_key = api_key or Settings.dextools_api
         self.session = session
         self.max_retries = max_retries
         self.rate_limiter = RateLimiter(
