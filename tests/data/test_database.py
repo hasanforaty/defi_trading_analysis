@@ -3,6 +3,7 @@ import pytest
 from sqlalchemy import text
 from src.data.database import Database
 
+
 @pytest.mark.asyncio
 async def test_database_connection(test_db):
     """Test database connection."""
@@ -11,6 +12,7 @@ async def test_database_connection(test_db):
         result = await session.execute(text("SELECT 1"))
         value = result.scalar()
         assert value == 1
+
 
 @pytest.mark.asyncio
 async def test_database_session_context_manager(test_db):
