@@ -1,277 +1,164 @@
-# src/api/cache.py
+"""Cache management for API responses."""
 import json
-import time
+import logging
 import asyncio
-from typing import Any, Dict, Optional, TypeVar, Generic, Callable, Union, List
+from typing import Any, Dict, Optional, Union, Callable
 from datetime import datetime, timedelta
-from loguru import logger
-import redis.asyncio as redis
+import time
 
-from config.settings import settings
+from config import settings
 
-T = TypeVar('T')
+try:
+    import redis.asyncio as redis
+
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+from config.settings import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryCache:
+    """Simple in-memory cache implementation."""
+
+    def __init__(self):
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get a value from the cache."""
+        async with self._lock:
+            cache_item = self._cache.get(key)
+            if cache_item is None:
+                return None
+
+            # Check if item is expired
+            if cache_item.get('expiry') and time.time() > cache_item['expiry']:
+                del self._cache[key]
+                return None
+
+            return cache_item['value']
+
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        """Set a value in the cache with optional TTL in seconds."""
+        async with self._lock:
+            cache_item: Dict[str, Any] = {'value': value}
+            if ttl:
+                cache_item['expiry'] = time.time() + ttl
+            self._cache[key] = cache_item
+
+    async def delete(self, key: str) -> None:
+        """Delete a key from the cache."""
+        async with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+
+    async def clear(self) -> None:
+        """Clear all items from the cache."""
+        async with self._lock:
+            self._cache.clear()
+
+
+class RedisCache:
+    """Redis-backed cache implementation."""
+
+    def __init__(self, redis_url: str):
+        self.redis = redis.from_url(redis_url)
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get a value from Redis cache."""
+        value = await self.redis.get(key)
+        if value:
+            return json.loads(value)
+        return None
+
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        """Set a value in Redis cache with optional TTL in seconds."""
+        serialized = json.dumps(value)
+        if ttl:
+            await self.redis.setex(key, ttl, serialized)
+        else:
+            await self.redis.set(key, serialized)
+
+    async def delete(self, key: str) -> None:
+        """Delete a key from Redis cache."""
+        await self.redis.delete(key)
+
+    async def clear(self) -> None:
+        """Clear all items from Redis cache with a specific prefix."""
+        # This is a simplified implementation. In production, you might
+        # want to use a more sophisticated approach to only clear your app's keys.
+        all_keys = await self.redis.keys('dextools:*')
+        if all_keys:
+            await self.redis.delete(*all_keys)
 
 
 class CacheManager:
-    """
-    Cache manager that handles caching API responses and other data.
-    Supports both Redis and in-memory caching.
-    """
+    """Cache manager that can work with either Redis or in-memory cache."""
 
-    def __init__(self, use_redis: bool = True, default_ttl: int = 300):
-        """
-        Initialize the cache manager.
+    def __init__(self, prefix: str = "dextools"):
+        self.prefix = prefix
 
-        Args:
-            use_redis: Whether to use Redis or in-memory cache.
-            default_ttl: Default time-to-live in seconds for cached items.
-        """
-        self.use_redis = use_redis and settings.redis_url is not None
-        self.default_ttl = default_ttl
-        self._memory_cache: Dict[str, Dict[str, Any]] = {}
-        self._redis_client: Optional[redis.Redis] = None
-        self._lock = asyncio.Lock()
+        # Try to use Redis if it's available and configured
+        if REDIS_AVAILABLE and hasattr(settings, 'REDIS_URL') and settings.REDIS_URL:
+            logger.info("Using Redis cache")
+            self.cache = RedisCache(settings.REDIS_URL)
+        else:
+            logger.info("Using in-memory cache")
+            self.cache = MemoryCache()
 
-        # Initialize Redis if enabled
-        if self.use_redis:
-            try:
-                self._redis_client = redis.from_url(settings.redis_url)
-                logger.info("Redis cache initialized")
-            except Exception as e:
-                self.use_redis = False
-                logger.warning(f"Failed to initialize Redis. Falling back to in-memory cache. Error: {e}")
+    def _format_key(self, key: str) -> str:
+        """Format a cache key with the prefix."""
+        return f"{self.prefix}:{key}"
 
-    async def _set_memory_cache(self, key: str, value: Any, ttl: int) -> None:
-        """Set a value in the in-memory cache with TTL."""
-        expiry = time.time() + ttl
-        self._memory_cache[key] = {
-            'value': value,
-            'expiry': expiry
-        }
-
-    async def _get_memory_cache(self, key: str) -> Optional[Any]:
-        """Get a value from the in-memory cache, respecting TTL."""
-        if key not in self._memory_cache:
-            return None
-
-        cache_item = self._memory_cache[key]
-        current_time = time.time()
-
-        # Check if the item is expired
-        if current_time > cache_item['expiry']:
-            del self._memory_cache[key]
-            return None
-
-        return cache_item['value']
-
-    async def _clean_memory_cache(self) -> None:
-        """Clean expired items from the in-memory cache."""
-        current_time = time.time()
-        keys_to_remove = []
-
-        for key, item in self._memory_cache.items():
-            if current_time > item['expiry']:
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del self._memory_cache[key]
+    async def get(self, key: str) -> Optional[Any]:
+        """Get a value from the cache."""
+        full_key = self._format_key(key)
+        return await self.cache.get(full_key)
 
     async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        """Set a value in the cache with optional TTL in seconds."""
+        full_key = self._format_key(key)
+        await self.cache.set(full_key, value, ttl)
+
+    async def delete(self, key: str) -> None:
+        """Delete a key from the cache."""
+        full_key = self._format_key(key)
+        await self.cache.delete(full_key)
+
+    async def clear(self) -> None:
+        """Clear all items from the cache."""
+        await self.cache.clear()
+
+    async def cached(self, key_prefix: str, func: Callable, *args, ttl: Optional[int] = 300, **kwargs) -> Any:
         """
-        Set a value in the cache.
+        Decorator-like function to cache the results of a function call.
 
         Args:
-            key: The cache key.
-            value: The value to cache.
-            ttl: Time-to-live in seconds. If None, uses the default TTL.
-        """
-        if ttl is None:
-            ttl = self.default_ttl
-
-        # Serialize the value if it's not a simple type
-        if not isinstance(value, (str, int, float, bool)) or value is None:
-            value = json.dumps(value)
-
-        async with self._lock:
-            if self.use_redis and self._redis_client:
-                try:
-                    await self._redis_client.setex(key, ttl, value)
-                    logger.debug(f"Set key '{key}' in Redis cache with TTL {ttl}s")
-                except Exception as e:
-                    logger.error(f"Error setting Redis cache for key '{key}': {e}")
-                    await self._set_memory_cache(key, value, ttl)
-            else:
-                await self._set_memory_cache(key, value, ttl)
-                logger.debug(f"Set key '{key}' in memory cache with TTL {ttl}s")
-
-    async def get(self, key: str, default: Any = None) -> Any:
-        """
-        Get a value from the cache.
-
-        Args:
-            key: The cache key.
-            default: Default value to return if the key doesn't exist.
+            key_prefix: Prefix for the cache key
+            func: Function to call if cache misses
+            ttl: Time-to-live for the cache entry in seconds
+            *args, **kwargs: Arguments to pass to the function
 
         Returns:
-            The cached value or the default value if not found.
+            The result of the function call, either from cache or fresh
         """
-        async with self._lock:
-            if self.use_redis and self._redis_client:
-                try:
-                    value = await self._redis_client.get(key)
-                    if value is None:
-                        return default
+        # Create a cache key from the function name and arguments
+        key_parts = [key_prefix]
+        key_parts.extend([str(arg) for arg in args])
+        key_parts.extend([f"{k}={v}" for k, v in kwargs.items()])
+        cache_key = ":".join(key_parts)
 
-                    # Try to deserialize if it's a string
-                    if isinstance(value, bytes):
-                        value = value.decode('utf-8')
+        # Try to get from cache
+        cached_value = await self.get(cache_key)
+        if cached_value is not None:
+            logger.debug(f"Cache hit for {cache_key}")
+            return cached_value
 
-                    try:
-                        return json.loads(value)
-                    except (json.JSONDecodeError, TypeError):
-                        return value
-
-                except Exception as e:
-                    logger.error(f"Error getting Redis cache for key '{key}': {e}")
-                    # Fallback to memory cache
-                    value = await self._get_memory_cache(key)
-                    return value if value is not None else default
-            else:
-                value = await self._get_memory_cache(key)
-                return value if value is not None else default
-
-    async def delete(self, key: str) -> bool:
-        """
-        Delete a key from the cache.
-
-        Args:
-            key: The cache key to delete.
-
-        Returns:
-            True if the key was deleted, False otherwise.
-        """
-        async with self._lock:
-            if self.use_redis and self._redis_client:
-                try:
-                    result = await self._redis_client.delete(key)
-                    success = result > 0
-                except Exception as e:
-                    logger.error(f"Error deleting Redis cache for key '{key}': {e}")
-                    success = False
-
-                # Also delete from memory cache if it exists
-                if key in self._memory_cache:
-                    del self._memory_cache[key]
-                    success = True
-
-                return success
-            else:
-                if key in self._memory_cache:
-                    del self._memory_cache[key]
-                    return True
-                return False
-
-    async def clear_all(self) -> bool:
-        """
-        Clear all cached data.
-
-        Returns:
-            True if the operation was successful, False otherwise.
-        """
-        async with self._lock:
-            if self.use_redis and self._redis_client:
-                try:
-                    await self._redis_client.flushdb()
-                    logger.info("Redis cache cleared")
-                except Exception as e:
-                    logger.error(f"Error clearing Redis cache: {e}")
-
-            # Clear memory cache
-            self._memory_cache.clear()
-            logger.info("Memory cache cleared")
-            return True
-
-    async def invalidate_pattern(self, pattern: str) -> int:
-        """
-        Delete all keys matching a pattern.
-
-        Args:
-            pattern: The pattern to match (e.g., "user:*").
-
-        Returns:
-            Number of keys deleted.
-        """
-        count = 0
-        async with self._lock:
-            if self.use_redis and self._redis_client:
-                try:
-                    # Get all keys matching the pattern
-                    keys = await self._redis_client.keys(pattern)
-                    if keys:
-                        count = await self._redis_client.delete(*keys)
-                        logger.info(f"Deleted {count} keys matching pattern '{pattern}' from Redis")
-                except Exception as e:
-                    logger.error(f"Error invalidating Redis keys with pattern '{pattern}': {e}")
-
-            # Also invalidate memory cache with simple pattern matching
-            # This is a simplified version of Redis pattern matching
-            memory_keys = list(self._memory_cache.keys())
-            for key in memory_keys:
-                if self._match_pattern(key, pattern):
-                    del self._memory_cache[key]
-                    count += 1
-
-            if count:
-                logger.info(f"Deleted {count} keys matching pattern '{pattern}' from memory cache")
-
-            return count
-
-    def _match_pattern(self, key: str, pattern: str) -> bool:
-        """
-        Simple implementation of Redis-like pattern matching.
-        Supports only the * wildcard.
-
-        Args:
-            key: The key to check.
-            pattern: The pattern to match against.
-
-        Returns:
-            True if the key matches the pattern, False otherwise.
-        """
-        # Replace * with .* for regex
-        import re
-        regex_pattern = pattern.replace("*", ".*")
-        return bool(re.match(f"^{regex_pattern}$", key))
-
-    async def get_stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the cache.
-
-        Returns:
-            Dictionary with cache statistics.
-        """
-        async with self._lock:
-            stats = {
-                "type": "redis" if self.use_redis else "memory",
-                "memory_cache_size": len(self._memory_cache),
-                "default_ttl": self.default_ttl,
-            }
-
-            if self.use_redis and self._redis_client:
-                try:
-                    info = await self._redis_client.info()
-                    stats.update({
-                        "redis_used_memory": info.get("used_memory_human", "N/A"),
-                        "redis_total_keys": info.get("db0", {}).get("keys", 0),
-                        "redis_uptime": info.get("uptime_in_seconds", 0),
-                    })
-                except Exception as e:
-                    logger.error(f"Error getting Redis info: {e}")
-
-            return stats
-
-    async def close(self) -> None:
-        """Close connections and clean up resources."""
-        if self.use_redis and self._redis_client:
-            await self._redis_client.close()
-            logger.info("Redis connection closed")
+        # Call the function and cache the result
+        logger.debug(f"Cache miss for {cache_key}, calling function")
+        result = await func(*args, **kwargs)
+        await self.set(cache_key, result, ttl)
+        return result

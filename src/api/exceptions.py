@@ -1,42 +1,61 @@
-# src/api/exceptions.py
-from typing import Optional, Dict, Any
+"""Custom exceptions for API-related errors."""
+from typing import Optional
 
 
-class DexToolsApiError(Exception):
-    """Base exception for DexTools API errors."""
+class APIError(Exception):
+    """Base class for all API-related errors."""
 
-    def __init__(self, message: str, status_code: Optional[int] = None, response_data: Optional[Dict[str, Any]] = None):
+    def __init__(self, message: str, status_code: Optional[int] = None):
         self.message = message
         self.status_code = status_code
-        self.response_data = response_data
         super().__init__(self.message)
 
 
-class RateLimitExceededError(DexToolsApiError):
-    """Exception raised when the API rate limit is exceeded."""
-    pass
+class AuthenticationError(APIError):
+    """Raised when API authentication fails."""
+
+    def __init__(self, message: str = "Authentication failed, check your API key"):
+        super().__init__(message, 403)
 
 
-class AuthenticationError(DexToolsApiError):
-    """Exception raised when there's an authentication error with the API."""
-    pass
+class RateLimitError(APIError):
+    """Raised when API rate limit is exceeded."""
+
+    def __init__(self, message: str = "Rate limit exceeded", retry_after: Optional[int] = None):
+        self.retry_after = retry_after
+        super().__init__(message, 429)
 
 
-class NetworkError(DexToolsApiError):
-    """Exception raised when there's a network error."""
-    pass
+class ResourceNotFoundError(APIError):
+    """Raised when the requested resource is not found."""
+
+    def __init__(self, resource: str):
+        super().__init__(f"Resource not found: {resource}", 404)
 
 
-class InvalidRequestError(DexToolsApiError):
-    """Exception raised when the request to the API is invalid."""
-    pass
+class BadRequestError(APIError):
+    """Raised when the request is malformed or invalid."""
+
+    def __init__(self, message: str = "Invalid request parameters"):
+        super().__init__(message, 400)
 
 
-class ResourceNotFoundError(DexToolsApiError):
-    """Exception raised when the requested resource is not found."""
-    pass
+class ServerError(APIError):
+    """Raised when the server returns an error."""
+
+    def __init__(self, message: str = "Server error", status_code: int = 500):
+        super().__init__(message, status_code)
 
 
-class UnexpectedResponseError(DexToolsApiError):
-    """Exception raised when the API response doesn't match the expected format."""
-    pass
+class NetworkError(APIError):
+    """Raised when there's a network-related error."""
+
+    def __init__(self, message: str = "Network error"):
+        super().__init__(message)
+
+
+class MaxRetryError(APIError):
+    """Raised when maximum retry attempts are exceeded."""
+
+    def __init__(self, message: str = "Maximum retry attempts exceeded"):
+        super().__init__(message)

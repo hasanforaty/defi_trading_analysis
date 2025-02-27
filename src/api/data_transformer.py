@@ -1,214 +1,181 @@
-# src/api/data_transformer.py
-from datetime import datetime
-from typing import Dict, List, Any, Tuple, Optional
+"""Utilities for transforming API data to internal models."""
+import logging
+from typing import Dict, List, Any, Optional
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
-def transform_pair_info(
-        pair_info: Dict[str, Any],
-        chain: str
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def parse_datetime(datetime_str: str) -> datetime:
     """
-    Transform raw pair info from the API into database models.
+    Parse ISO datetime string to datetime object.
 
     Args:
-        pair_info: Raw pair info from the API
-        chain: Blockchain ID
+        datetime_str: ISO format datetime string
 
     Returns:
-        Tuple of (pair_data, token1_data, token2_data)
+        datetime object
     """
-    # Extract token data
-    main_token = pair_info.get("mainToken", {})
-    side_token = pair_info.get("sideToken", {})
-
-    # Create token1 data (main token)
-    token1_data = {
-        "chain": chain,
-        "address": main_token.get("address", ""),
-        "name": main_token.get("name", ""),
-        "symbol": main_token.get("symbol", ""),
-        "decimals": main_token.get("decimals", 18),
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-    }
-
-    # Create token2 data (side token)
-    token2_data = {
-        "chain": chain,
-        "address": side_token.get("address", ""),
-        "name": side_token.get("name", ""),
-        "symbol": side_token.get("symbol", ""),
-        "decimals": side_token.get("decimals", 18),
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-    }
-
-    # Parse creation time
-    creation_time_str = pair_info.get("creationTime", "")
-    try:
-        creation_time = datetime.fromisoformat(creation_time_str.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        creation_time = datetime.utcnow()
-
-    # Create pair data
-    pair_data = {
-        "chain": chain,
-        "address": pair_info.get("address", ""),
-        "dex_name": pair_info.get("exchangeName", ""),
-        "dex_factory": pair_info.get("exchangeFactory", ""),
-        "fee": pair_info.get("fee", 0.0),
-        "creation_time": creation_time,
-        "creation_block": pair_info.get("creationBlock", 0),
-        "token1_id": None,  # To be filled later
-        "token2_id": None,  # To be filled later
-        "token1_reserve": 0.0,
-        "token2_reserve": 0.0,
-        "liquidity_usd": 0.0,
-        "price_usd": 0.0,
-        "price_native": 0.0,
-        "volume_24h": 0.0,
-        "tx_count_24h": 0,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-    }
-
-    return pair_data, token1_data, token2_data
+    return datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
 
 
-def transform_transaction(
-        tx_data: Dict[str, Any],
-        pair_id: int,
-        token_ids: Tuple[int, int]
-) -> Dict[str, Any]:
+def normalize_transaction_data(raw_transaction: Dict[str, Any], chain: str, pair_address: str) -> Dict[str, Any]:
     """
-    Transform raw transaction data from the API into database model.
+    Normalize transaction data from the API.
 
     Args:
-        tx_data: Raw transaction data from the API
-        pair_id: ID of the pair in the database
-        token_ids: Tuple of (token1_id, token2_id)
+        raw_transaction: Raw transaction data from API
+        chain: Blockchain identifier
+        pair_address: Trading pair contract address
 
     Returns:
-        Transformed transaction data
+        Normalized transaction dictionary
     """
-    # Extract basic transaction info
-    tx_hash = tx_data.get("txHash", "")
-    block_number = tx_data.get("blockNumber", 0)
-    chain = tx_data.get("chain", "")
+    # Extract relevant fields
+    tx_hash = raw_transaction.get('txHash')
+    block_number = raw_transaction.get('blockNumber')
+    timestamp = raw_transaction.get('timestamp')
 
-    # Parse timestamp
-    timestamp_str = tx_data.get("timestamp", "")
-    try:
-        timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        timestamp = datetime.utcnow()
+    if isinstance(timestamp, str):
+        timestamp = parse_datetime(timestamp)
 
-    # Determine transaction type (buy/sell)
-    # In DexTools API, 'type' field has values like 'buy', 'sell', 'unknown'
-    tx_type = tx_data.get("type", "unknown").lower()
+    # Transaction type (buy, sell, etc.)
+    tx_type = raw_transaction.get('type', 'unknown')
 
-    # Extract amounts and prices
-    amount_in_token = tx_data.get("amountIn", 0.0)
-    amount_out_token = tx_data.get("amountOut", 0.0)
-    price_usd = tx_data.get("priceUsd", 0.0)
-    price_native = tx_data.get("priceNative", 0.0)
+    # Token amounts
+    token0_amount = raw_transaction.get('token0Amount', 0)
+    token1_amount = raw_transaction.get('token1Amount', 0)
 
-    # Determine which token is being bought/sold
-    token1_id, token2_id = token_ids
-    if tx_type == "buy":
-        # Buying main token, selling side token
-        from_token_id = token2_id
-        to_token_id = token1_id
-    else:
-        # Selling main token, buying side token
-        from_token_id = token1_id
-        to_token_id = token2_id
+    # Wallet address
+    wallet_address = raw_transaction.get('walletAddress', '')
 
-    # Create transformed transaction data
-    transformed_data = {
-        "pair_id": pair_id,
-        "chain": chain,
-        "tx_hash": tx_hash,
-        "block_number": block_number,
-        "timestamp": timestamp,
-        "tx_type": tx_type,
-        "from_token_id": from_token_id,
-        "to_token_id": to_token_id,
-        "from_address": tx_data.get("from", ""),
-        "to_address": tx_data.get("to", ""),
-        "amount_in": amount_in_token,
-        "amount_out": amount_out_token,
-        "price_usd": price_usd,
-        "price_native": price_native,
-        "value_usd": tx_data.get("valueUsd", 0.0),
-        "created_at": datetime.utcnow(),
+    # Price impact and other fields
+    price_impact = raw_transaction.get('priceImpact', 0)
+    price = raw_transaction.get('price', 0)
+
+    return {
+        'tx_hash': tx_hash,
+        'block_number': block_number,
+        'timestamp': timestamp,
+        'chain': chain,
+        'pair_address': pair_address,
+        'tx_type': tx_type,
+        'token0_amount': token0_amount,
+        'token1_amount': token1_amount,
+        'wallet_address': wallet_address,
+        'price_impact': price_impact,
+        'price': price
     }
 
-    return transformed_data
 
-
-def filter_transactions(
-        transactions: List[Dict[str, Any]],
-        min_value_usd: float = 0.0,
-        tx_types: Optional[List[str]] = None
-) -> List[Dict[str, Any]]:
+def normalize_pair_info(raw_pair_info: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Filter transactions based on criteria.
+    Normalize pair information from the API.
 
     Args:
-        transactions: List of raw transaction data
-        min_value_usd: Minimum transaction value in USD
-        tx_types: List of transaction types to include (e.g., ["buy", "sell"])
+        raw_pair_info: Raw pair information from API
 
     Returns:
-        Filtered list of transactions
+        Normalized pair information dictionary
     """
-    result = []
+    # Basic pair info
+    exchange_name = raw_pair_info.get('exchangeName', '')
+    exchange_factory = raw_pair_info.get('exchangeFactory', '')
 
-    for tx in transactions:
-        # Check value threshold
-        if min_value_usd > 0 and tx.get("valueUsd", 0.0) < min_value_usd:
-            continue
+    # Creation info
+    creation_time = raw_pair_info.get('creationTime')
+    if isinstance(creation_time, str):
+        creation_time = parse_datetime(creation_time)
 
-        # Check transaction type
-        if tx_types is not None and tx.get("type", "").lower() not in [t.lower() for t in tx_types]:
-            continue
+    creation_block = raw_pair_info.get('creationBlock', 0)
 
-        result.append(tx)
+    # Token info
+    main_token = raw_pair_info.get('mainToken', {})
+    side_token = raw_pair_info.get('sideToken', {})
 
-    return result
+    # Fee
+    fee = raw_pair_info.get('fee', 0)
+
+    return {
+        'exchange_name': exchange_name,
+        'exchange_factory': exchange_factory,
+        'creation_time': creation_time,
+        'creation_block': creation_block,
+        'main_token_address': main_token.get('address', ''),
+        'main_token_symbol': main_token.get('symbol', ''),
+        'main_token_name': main_token.get('name', ''),
+        'side_token_address': side_token.get('address', ''),
+        'side_token_symbol': side_token.get('symbol', ''),
+        'side_token_name': side_token.get('name', ''),
+        'fee': fee
+    }
 
 
-def normalize_timestamps(
-        transactions: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
+def normalize_liquidity_data(raw_liquidity: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize timestamps in transaction data.
+    Normalize liquidity data from the API.
 
     Args:
-        transactions: List of raw transaction data
+        raw_liquidity: Raw liquidity data from API
 
     Returns:
-        Transactions with normalized timestamps
+        Normalized liquidity dictionary
     """
-    result = []
+    # Extract reserves
+    reserves = raw_liquidity.get('reserves', {})
 
-    for tx in transactions:
-        # Make a copy of the transaction
-        normalized_tx = tx.copy()
+    main_token_reserves = reserves.get('mainToken', 0)
+    side_token_reserves = reserves.get('sideToken', 0)
 
-        # Parse timestamp
-        timestamp_str = tx.get("timestamp", "")
-        try:
-            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            # Convert to UTC timestamp in seconds
-            normalized_tx["timestamp_unix"] = int(timestamp.timestamp())
-            # Format as ISO string
-            normalized_tx["timestamp_iso"] = timestamp.isoformat()
-        except (ValueError, TypeError):
-            # Keep original if parsing fails
-            pass
+    # Extract liquidity
+    liquidity = raw_liquidity.get('liquidity', 0)
 
-        result.append(normalized_tx)
+    return {
+        'main_token_reserves': main_token_reserves,
+        'side_token_reserves': side_token_reserves,
+        'liquidity': liquidity
+    }
 
-    return result
+
+def normalize_price_data(raw_price: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize price data from the API.
+
+    Args:
+        raw_price: Raw price data from API
+
+    Returns:
+        Normalized price dictionary
+    """
+    # Current price
+    price_usd = raw_price.get('priceUsd', 0)
+    price_native = raw_price.get('priceNative', 0)
+
+    # Volume
+    volume_usd = raw_price.get('volumeUsd', 0)
+
+    # Buy/sell metrics
+    buy_count = raw_price.get('buyCount', 0)
+    sell_count = raw_price.get('sellCount', 0)
+    buy_volume = raw_price.get('buyVolume', 0)
+    sell_volume = raw_price.get('sellVolume', 0)
+
+    # Price change percentages
+    price_change_5m = raw_price.get('priceChange5m', 0)
+    price_change_1h = raw_price.get('priceChange1h', 0)
+    price_change_6h = raw_price.get('priceChange6h', 0)
+    price_change_24h = raw_price.get('priceChange24h', 0)
+
+    return {
+        'price_usd': price_usd,
+        'price_native': price_native,
+        'volume_usd': volume_usd,
+        'buy_count': buy_count,
+        'sell_count': sell_count,
+        'buy_volume': buy_volume,
+        'sell_volume': sell_volume,
+        'price_change_5m': price_change_5m,
+        'price_change_1h': price_change_1h,
+        'price_change_6h': price_change_6h,
+        'price_change_24h': price_change_24h
+    }

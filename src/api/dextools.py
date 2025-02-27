@@ -1,338 +1,263 @@
-# src/api/dextools.py
+"""DexTools API client implementation."""
 import asyncio
+import logging
 import json
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Union, Tuple, cast
-import aiohttp
-from loguru import logger
+from typing import Dict, List, Optional, Union, Any
+import time
+from datetime import datetime, timezone
+import backoff
 
-from config.settings import settings
+import aiohttp
+from aiohttp.client_exceptions import ClientError, ClientResponseError
+
+from src.config import settings
 from src.api.exceptions import (
-    AuthenticationError,
-    DexToolsApiError,
-    InvalidRequestError,
-    NetworkError,
-    RateLimitExceededError,
-    ResourceNotFoundError,
-    UnexpectedResponseError,
+    APIError, AuthenticationError, RateLimitError,
+    ResourceNotFoundError, BadRequestError, ServerError,
+    NetworkError, MaxRetryError
 )
 from src.api.rate_limiter import RateLimiter
-from src.api.cache import CacheManager
-from src.models.pair import Pair
-from src.models.token import Token
-from src.models.transaction import Transaction
+
+logger = logging.getLogger(__name__)
 
 
 class DexToolsApiClient:
     """
     Client for interacting with the DexTools API.
-    Handles authentication, request formation, and response parsing.
+
+    This client provides methods to access DexTools API endpoints
+    for obtaining pair information, transactions, and liquidity data.
     """
 
-    # Base URL for the DexTools API
     BASE_URL = "https://public-api.dextools.io/standard"
 
     def __init__(
             self,
             api_key: Optional[str] = None,
-            cache_manager: Optional[CacheManager] = None,
-            rate_limiter: Optional[RateLimiter] = None,
+            requests_per_second: int = 5,
+            requests_per_minute: int = 100,
             max_retries: int = 3,
-            retry_delay: float = 1.0,
-            timeout: float = 30.0,
+            session: Optional[aiohttp.ClientSession] = None
     ):
         """
         Initialize the DexTools API client.
 
         Args:
-            api_key: The API key for DexTools API.
-            cache_manager: Instance of CacheManager for caching responses.
-            rate_limiter: Instance of RateLimiter for rate limiting requests.
-            max_retries: Maximum number of retries for failed requests.
-            retry_delay: Initial delay between retries in seconds.
-            timeout: Timeout for API requests in seconds.
+            api_key: DexTools API key, defaults to settings.DEXTOOLS_API_KEY
+            requests_per_second: Maximum requests per second
+            requests_per_minute: Maximum requests per minute
+            max_retries: Maximum number of retries for failed requests
+            session: Aiohttp session to use, will create one if not provided
         """
-        self.api_key = api_key or settings.dextools_api_key
-        if not self.api_key:
-            raise ValueError("DexTools API key is required")
-
-        self.cache_manager = cache_manager or CacheManager()
-        self.rate_limiter = rate_limiter or RateLimiter()
+        self.api_key = api_key or settings.DEXTOOLS_API_KEY
+        self.session = session
         self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.timeout = timeout
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.rate_limiter = RateLimiter(
+            requests_per_second=requests_per_second,
+            requests_per_minute=requests_per_minute
+        )
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create an aiohttp session."""
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-                headers=self._get_headers(),
-            )
-        return self.session
+    async def __aenter__(self):
+        """Enter async context."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit async context."""
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
 
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for API requests."""
         return {
             "X-API-KEY": self.api_key,
-            "Accept": "application/json",
             "Content-Type": "application/json",
+            "Accept": "application/json"
         }
 
+    @backoff.on_exception(
+        backoff.expo,
+        (NetworkError, ServerError),
+        max_tries=3,
+        giveup=lambda e: isinstance(e, (AuthenticationError, ResourceNotFoundError, BadRequestError))
+    )
     async def _make_request(
             self,
             method: str,
             endpoint: str,
             params: Optional[Dict[str, Any]] = None,
             data: Optional[Dict[str, Any]] = None,
-            retry_count: int = 0,
+            timeout: int = 30
     ) -> Dict[str, Any]:
         """
-        Make an HTTP request to the DexTools API.
+        Make a request to the DexTools API.
 
         Args:
             method: HTTP method (GET, POST, etc.)
-            endpoint: API endpoint
+            endpoint: API endpoint path
             params: Query parameters
-            data: Request body
-            retry_count: Current retry attempt
+            data: Request body data
+            timeout: Request timeout in seconds
 
         Returns:
-            Parsed JSON response
+            API response as a dictionary
 
         Raises:
-            Various DexToolsApiError subclasses based on the error type
+            AuthenticationError: If the API key is invalid
+            RateLimitError: If the rate limit is exceeded
+            ResourceNotFoundError: If the requested resource is not found
+            BadRequestError: If the request is invalid
+            ServerError: If the server returns an error
+            NetworkError: If there's a network error
+            MaxRetryError: If the maximum retry count is exceeded
         """
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+        # Wait for rate limit slot
+        if not await self.rate_limiter.wait_until_available(timeout=10):
+            logger.warning("Rate limit slot not available after waiting")
+            raise RateLimitError("Rate limit exceeded, couldn't acquire slot")
+
         url = f"{self.BASE_URL}{endpoint}"
-        cache_key = f"dextools:{method}:{endpoint}:{json.dumps(params or {})}:{json.dumps(data or {})}"
-
-        # Try to get from cache first
-        cached_response = await self.cache_manager.get(cache_key)
-        if cached_response is not None:
-            logger.debug(f"Cache hit for {url}")
-            return cached_response
-
-        # Apply rate limiting before making the request
-        await self.rate_limiter.acquire(endpoint)
+        headers = self._get_headers()
 
         try:
-            session = await self._get_session()
-
-            logger.debug(f"Making {method} request to {url} with params={params}")
-
-            async with session.request(
+            logger.debug(f"Making {method} request to {url}")
+            async with self.session.request(
                     method=method,
                     url=url,
                     params=params,
-                    json=data
+                    json=data,
+                    headers=headers,
+                    timeout=timeout
             ) as response:
-                # Handle different response status codes
-                if response.status == 200:
-                    resp_data = await response.json()
-
-                    # Cache the successful response
-                    ttl = self._determine_cache_ttl(endpoint)
-                    await self.cache_manager.set(cache_key, resp_data, ttl)
-
-                    return resp_data
-
-                elif response.status == 400:
-                    raise InvalidRequestError(
-                        f"Invalid request: {await response.text()}",
-                        status_code=response.status
-                    )
-
-                elif response.status == 401 or response.status == 403:
-                    raise AuthenticationError(
-                        f"Authentication error: {await response.text()}",
-                        status_code=response.status
-                    )
-
-                elif response.status == 404:
-                    raise ResourceNotFoundError(
-                        f"Resource not found: {await response.text()}",
-                        status_code=response.status
-                    )
+                # Check for error responses
+                if response.status == 403:
+                    logger.error("Authentication failed")
+                    raise AuthenticationError()
 
                 elif response.status == 429:
-                    raise RateLimitExceededError(
-                        f"Rate limit exceeded: {await response.text()}",
-                        status_code=response.status
-                    )
+                    retry_after = int(response.headers.get("Retry-After", 60))
+                    logger.warning(f"Rate limit exceeded, retry after {retry_after}s")
+                    raise RateLimitError(retry_after=retry_after)
 
-                else:
-                    raise DexToolsApiError(
-                        f"API error ({response.status}): {await response.text()}",
-                        status_code=response.status
-                    )
+                elif response.status == 404:
+                    logger.error(f"Resource not found: {url}")
+                    raise ResourceNotFoundError(url)
 
-        except (RateLimitExceededError, DexToolsApiError) as e:
-            # For rate limit errors or server errors, retry with backoff
-            if retry_count < self.max_retries:
-                backoff_time = self.retry_delay * (2 ** retry_count)
-                logger.warning(
-                    f"Request failed with {e.__class__.__name__}, retrying in {backoff_time:.2f}s "
-                    f"(attempt {retry_count + 1}/{self.max_retries})"
-                )
-                await asyncio.sleep(backoff_time)
-                return await self._make_request(method, endpoint, params, data, retry_count + 1)
+                elif response.status == 400:
+                    error_text = await response.text()
+                    logger.error(f"Bad request: {error_text}")
+                    raise BadRequestError(f"Invalid request: {error_text}")
+
+                elif response.status >= 500:
+                    error_text = await response.text()
+                    logger.error(f"Server error ({response.status}): {error_text}")
+                    raise ServerError(f"Server error: {error_text}", response.status)
+
+                # Ensure successful response
+                response.raise_for_status()
+
+                # Parse JSON response
+                return await response.json()
+
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"Response error: {e}")
             raise
-
         except aiohttp.ClientError as e:
-            logger.error(f"Network error: {e}")
-            if retry_count < self.max_retries:
-                backoff_time = self.retry_delay * (2 ** retry_count)
-                logger.warning(
-                    f"Network error occurred, retrying in {backoff_time:.2f}s "
-                    f"(attempt {retry_count + 1}/{self.max_retries})"
-                )
-                await asyncio.sleep(backoff_time)
-                return await self._make_request(method, endpoint, params, data, retry_count + 1)
-            raise NetworkError(f"Network error after {self.max_retries} retries: {e}")
-
-        except Exception as e:
-            logger.error(f"Unexpected error in API request: {e}")
-            raise DexToolsApiError(f"Unexpected error: {e}")
-
-    def _determine_cache_ttl(self, endpoint: str) -> int:
-        """
-        Determine the appropriate cache TTL based on the endpoint.
-
-        Args:
-            endpoint: The API endpoint
-
-        Returns:
-            Cache TTL in seconds
-        """
-        # Different endpoints may have different cache TTLs
-        if "/price" in endpoint:
-            # Price data changes frequently
-            return 60  # 1 minute
-        elif "/transactions" in endpoint:
-            # Transaction data should be relatively fresh
-            return 300  # 5 minutes
-        elif "/liquidity" in endpoint:
-            # Liquidity data changes less frequently
-            return 600  # 10 minutes
-        elif "/pair" in endpoint or "/token" in endpoint:
-            # Static data can be cached longer
-            return 3600  # 1 hour
-        else:
-            # Default cache TTL
-            return 1800  # 30 minutes
+            logger.error(f"Request error: {e}")
+            raise NetworkError(f"Network error: {str(e)}")
+        except asyncio.TimeoutError:
+            logger.error("Request timed out")
+            raise NetworkError("Request timed out")
 
     async def get_pair_info(self, chain: str, pair_address: str) -> Dict[str, Any]:
         """
-        Get information about a specific trading pair.
+        Get information about a trading pair.
 
         Args:
-            chain: The blockchain ID (e.g., "ether" for Ethereum)
-            pair_address: The address of the trading pair
+            chain: Blockchain identifier (e.g., 'ether' for Ethereum)
+            pair_address: Trading pair contract address
 
         Returns:
-            Pair information
+            Dictionary containing pair information
         """
         endpoint = f"/v2/pool/{chain}/{pair_address}"
-        response = await self._make_request("GET", endpoint)
-
-        logger.info(f"Retrieved pair info for {pair_address} on {chain}")
-        return response
+        return await self._make_request("GET", endpoint)
 
     async def get_transactions(
             self,
             chain: str,
             pair_address: str,
-            from_timestamp: Optional[int] = None,
-            to_timestamp: Optional[int] = None,
+            from_timestamp: Optional[Union[int, datetime]] = None,
+            to_timestamp: Optional[Union[int, datetime]] = None,
             page: int = 0,
             page_size: int = 100
     ) -> Dict[str, Any]:
         """
-        Get transaction history for a specific trading pair.
+        Get transactions for a trading pair.
 
         Args:
-            chain: The blockchain ID (e.g., "ether" for Ethereum)
-            pair_address: The address of the trading pair
-            from_timestamp: Start timestamp (Unix time in seconds)
-            to_timestamp: End timestamp (Unix time in seconds)
-            page: Page number (0-indexed)
+            chain: Blockchain identifier
+            pair_address: Trading pair contract address
+            from_timestamp: Start timestamp (Unix timestamp or datetime)
+            to_timestamp: End timestamp (Unix timestamp or datetime)
+            page: Page number (starts at 0)
             page_size: Number of results per page
 
         Returns:
-            Transaction data
+            Dictionary containing transaction data
         """
-        endpoint = f"/v2/pool/{chain}/{pair_address}/swaps"
-
-        params: Dict[str, Any] = {
+        endpoint = f"/v2/pool/{chain}/{pair_address}/transactions"
+        params = {
             "page": page,
-            "pageSize": page_size,
+            "pageSize": page_size
         }
 
-        if from_timestamp is not None:
-            params["from"] = from_timestamp
+        # Add timestamp filters if provided
+        if from_timestamp:
+            if isinstance(from_timestamp, datetime):
+                # Convert to ISO string
+                params["from"] = from_timestamp.isoformat()
+            else:
+                params["from"] = from_timestamp
 
-        if to_timestamp is not None:
-            params["to"] = to_timestamp
+        if to_timestamp:
+            if isinstance(to_timestamp, datetime):
+                # Convert to ISO string
+                params["to"] = to_timestamp.isoformat()
+            else:
+                params["to"] = to_timestamp
 
-        response = await self._make_request("GET", endpoint, params=params)
-
-        logger.info(f"Retrieved transactions for {pair_address} on {chain} (page {page})")
-        return response
+        return await self._make_request("GET", endpoint, params=params)
 
     async def get_pair_liquidity(self, chain: str, pair_address: str) -> Dict[str, Any]:
         """
-        Get liquidity information for a specific trading pair.
+        Get liquidity information for a trading pair.
 
         Args:
-            chain: The blockchain ID (e.g., "ether" for Ethereum)
-            pair_address: The address of the trading pair
+            chain: Blockchain identifier
+            pair_address: Trading pair contract address
 
         Returns:
-            Liquidity information
+            Dictionary containing liquidity information
         """
         endpoint = f"/v2/pool/{chain}/{pair_address}/liquidity"
-        response = await self._make_request("GET", endpoint)
-
-        logger.info(f"Retrieved liquidity info for {pair_address} on {chain}")
-        return response
+        return await self._make_request("GET", endpoint)
 
     async def get_pair_price(self, chain: str, pair_address: str) -> Dict[str, Any]:
         """
-        Get price information for a specific trading pair.
+        Get price information for a trading pair.
 
         Args:
-            chain: The blockchain ID (e.g., "ether" for Ethereum)
-            pair_address: The address of the trading pair
+            chain: Blockchain identifier
+            pair_address: Trading pair contract address
 
         Returns:
-            Price information
+            Dictionary containing price information
         """
         endpoint = f"/v2/pool/{chain}/{pair_address}/price"
-        response = await self._make_request("GET", endpoint)
-
-        logger.info(f"Retrieved price info for {pair_address} on {chain}")
-        return response
-
-    async def get_token_info(self, chain: str, token_address: str) -> Dict[str, Any]:
-        """
-        Get information about a specific token.
-
-        Args:
-            chain: The blockchain ID (e.g., "ether" for Ethereum)
-            token_address: The address of the token
-
-        Returns:
-            Token information
-        """
-        endpoint = f"/v2/token/{chain}/{token_address}"
-        response = await self._make_request("GET", endpoint)
-
-        logger.info(f"Retrieved token info for {token_address} on {chain}")
-        return response
-
-    async def close(self) -> None:
-        """Close the client session."""
-        if self.session and not self.session.closed:
-            await self.session.close()
-            logger.info("DexTools API client session closed")
+        return await self._make_request("GET", endpoint)

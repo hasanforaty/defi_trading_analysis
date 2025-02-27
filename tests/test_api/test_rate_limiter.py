@@ -1,100 +1,106 @@
-# tests/test_api/test_rate_limiter.py
+"""Tests for the rate limiter."""
 import pytest
 import asyncio
 import time
-from datetime import datetime
+from unittest.mock import patch, Mock
 
 from src.api.rate_limiter import RateLimiter
 
 
 @pytest.fixture
 def rate_limiter():
-    # Configure a rate limiter with strict limits for testing
-    return RateLimiter(
-        requests_per_second=5,
-        requests_per_minute=10,
-        max_backoff_time=2.0,
-        initial_backoff_time=0.1,
-        backoff_factor=2.0
-    )
+    """Create a rate limiter with a small window for testing."""
+    return RateLimiter(requests_per_second=5, requests_per_minute=10)
 
 
 @pytest.mark.asyncio
-async def test_rate_limiter_basic(rate_limiter):
-    # Test basic acquisition
-    start_time = time.time()
+async def test_acquire_within_limits(rate_limiter):
+    """Test acquiring permission when within limits."""
+    # Should be able to acquire up to the per-second limit
+    for _ in range(rate_limiter.requests_per_second):
+        assert await rate_limiter.acquire() is True
 
-    # These should all be allowed
-    for _ in range(5):
+    # The next one should fail (exceeded per-second limit)
+    assert await rate_limiter.acquire() is False
+
+
+@pytest.mark.asyncio
+async def test_wait_until_available(rate_limiter):
+    """Test waiting until a request slot is available."""
+    # Use up all slots
+    for _ in range(rate_limiter.requests_per_second):
+        assert await rate_limiter.acquire() is True
+
+    # The next acquire should fail
+    assert await rate_limiter.acquire() is False
+
+    # Patch time to simulate passage of time
+    original_time = time.time
+
+    try:
+        # Mock time.time to return a value 1 second in the future
+        with patch('time.time', return_value=original_time() + 1):
+            # Should be able to acquire again after the second window resets
+            assert await rate_limiter.wait_until_available(timeout=0.1) is True
+    finally:
+        time.time = original_time
+
+
+@pytest.mark.asyncio
+async def test_wait_until_available_timeout(rate_limiter):
+    """Test timeout while waiting for a request slot."""
+    # Use up all slots
+    for _ in range(rate_limiter.requests_per_second):
+        assert await rate_limiter.acquire() is True
+
+    # Patch sleep to avoid actually waiting
+    with patch('asyncio.sleep', return_value=None):
+        # Wait with a tiny timeout, should fail
+        assert await rate_limiter.wait_until_available(timeout=0.001) is False
+
+
+@pytest.mark.asyncio
+async def test_per_minute_limit(rate_limiter):
+    """Test per-minute rate limiting."""
+    # Use up all per-minute slots
+    for _ in range(rate_limiter.requests_per_minute):
+        # Reset per-second counter after each second
+        if _ % rate_limiter.requests_per_second == 0 and _ > 0:
+            with patch('time.time', return_value=time.time() + 1):
+                rate_limiter._second_window_requests = 0
+                rate_limiter._last_second_reset = time.time()
+
+        assert await rate_limiter.acquire() is True
+
+    # The next one should fail (exceeded per-minute limit)
+    assert await rate_limiter.acquire() is False
+
+    # Patch time to simulate passage of time
+    original_time = time.time
+
+    try:
+        # Mock time.time to return a value 60 seconds in the future
+        with patch('time.time', return_value=original_time() + 60):
+            # Should be able to acquire again after the minute window resets
+            assert await rate_limiter.wait_until_available(timeout=0.1) is True
+    finally:
+        time.time = original_time
+
+
+@pytest.mark.asyncio
+async def test_get_stats(rate_limiter):
+    """Test getting rate limiter statistics."""
+    # Acquire some slots
+    for _ in range(3):
         await rate_limiter.acquire()
 
-    end_time = time.time()
-
-    # All 5 requests should be allowed quickly
-    assert end_time - start_time < 0.5, "Rate limiter should allow requests up to the limit"
-
-
-@pytest.mark.asyncio
-async def test_rate_limiter_second_limit(rate_limiter):
-    # Test second-based rate limiting
-    start_time = time.time()
-
-    # First 5 should be quick
-    for _ in range(5):
-        await rate_limiter.acquire()
-
-    # This one should be delayed
-    await rate_limiter.acquire()
-
-    end_time = time.time()
-
-    # The 6th request should be delayed
-    assert end_time - start_time >= 0.1, "Rate limiter should delay requests beyond the per-second limit"
-
-
-@pytest.mark.asyncio
-async def test_rate_limiter_minute_limit(rate_limiter):
-    # Test minute-based rate limiting
-    start_time = time.time()
-
-    # Make 10 requests to hit the minute limit
-    for _ in range(10):
-        await rate_limiter.acquire()
-
-    # This one should be delayed significantly
-    await rate_limiter.acquire()
-
-    end_time = time.time()
-
-    # The 11th request should be delayed
-    assert end_time - start_time >= 0.1, "Rate limiter should delay requests beyond the per-minute limit"
-
-
-@pytest.mark.asyncio
-async def test_rate_limiter_stats(rate_limiter):
-    # Test statistics tracking
-    await rate_limiter.acquire()
-    await rate_limiter.acquire()
-
+    # Get stats
     stats = rate_limiter.get_stats()
 
-    assert stats["total_requests"] == 2
-    assert "delayed_requests" in stats
-    assert "delay_percentage" in stats
-    assert "current_time" in stats
-
-
-@pytest.mark.asyncio
-async def test_rate_limiter_concurrent(rate_limiter):
-    # Test concurrent requests
-    async def make_request(id):
-        await rate_limiter.acquire()
-        return id
-
-    # Launch 10 concurrent requests
-    tasks = [make_request(i) for i in range(10)]
-    results = await asyncio.gather(*tasks)
-
-    # All tasks should complete
-    assert len(results) == 10
-    assert set(results) == set(range(10))
+    # Assert stats are correct
+    assert stats["second_window_requests"] == 3
+    assert stats["minute_window_requests"] == 3
+    assert stats["requests_per_second_limit"] == 5
+    assert stats["requests_per_minute_limit"] == 10
+    assert stats["second_window_usage"] == 3 / 5
+    assert stats["minute_window_usage"] == 3 / 10
