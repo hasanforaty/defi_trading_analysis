@@ -13,7 +13,7 @@ from src.data.database import get_db_session
 from src.analyzers.utils import time_window_to_datetime
 
 
-class WaveDetector:
+class WaveAnalyzer:
     """
     Detects buying or selling waves in transaction data.
     A "wave" is defined as a series of transactions from a single wallet within a timeframe.

@@ -31,7 +31,7 @@ class PatternConfidence(float, Enum):
     HIGH = 0.9
 
 
-class PatternRecognizer:
+class PatternAnalyzer:
     """
     Identifies common trading patterns in transaction data.
     Uses time-series analysis and multiple pattern matching techniques.

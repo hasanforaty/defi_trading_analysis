@@ -12,9 +12,9 @@ from config.settings import get_settings, TransactionType
 from src.models.entities import Pair, Transaction, WalletAnalysis, Wave
 from src.data.database import get_db_session
 from src.analyzers.threshold import ThresholdAnalyzer
-from src.analyzers.wave import WaveDetector
+from src.analyzers.wave import WaveAnalyzer
 from src.analyzers.ratio import RatioAnalyzer
-from src.analyzers.pattern import PatternRecognizer
+from src.analyzers.pattern import PatternAnalyzer
 from src.analyzers.utils import time_window_to_datetime
 
 
@@ -229,7 +229,7 @@ class AnalysisCoordinator:
         job.start()
 
         try:
-            detector = WaveDetector(session)
+            detector = WaveAnalyzer(session)
             pair_id = job.pair_id
             params = job.params
 
@@ -460,7 +460,7 @@ class AnalysisCoordinator:
         job.start()
 
         try:
-            recognizer = PatternRecognizer(session)
+            recognizer = PatternAnalyzer(session)
             pair_id = job.pair_id
             params = job.params
 
@@ -548,7 +548,7 @@ class AnalysisCoordinator:
             job.update_progress(25.0)
 
             # Run wave detection
-            wave_detector = WaveDetector(session)
+            wave_detector = WaveAnalyzer(session)
             buy_waves = await wave_detector.detect_buy_waves(pair_id, start_time, end_time)
             sell_waves = await wave_detector.detect_sell_waves(pair_id, start_time, end_time)
 
@@ -581,7 +581,7 @@ class AnalysisCoordinator:
             job.update_progress(75.0)
 
             # Run pattern recognition
-            pattern_recognizer = PatternRecognizer(session)
+            pattern_recognizer = PatternAnalyzer(session)
             patterns = await pattern_recognizer.identify_patterns(pair_id, start_time, end_time)
 
             job.update_progress(95.0)
