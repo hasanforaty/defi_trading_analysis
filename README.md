@@ -1,6 +1,4 @@
-Here's the main README.md file for the DeFi Trading Pattern Analysis Tool:
 
-```markdown
 # DeFi Trading Pattern Analysis Tool
 
 A comprehensive tool for analyzing trading patterns on decentralized exchanges using transaction data from DexTools API. This tool detects wave patterns in trading activities and generates detailed reports for traders and analysts.
